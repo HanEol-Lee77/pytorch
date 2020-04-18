@@ -12,6 +12,7 @@ try:
     # import torch_test_cpp_extension.cpp as cpp_extension
     # import torch_test_cpp_extension.msnpu as msnpu_extension
     # import torch_test_cpp_extension.rng as rng_extension
+    import torch_test_cpp_extension.csprng as csprng_extension
 except ImportError:
     raise RuntimeError(
         "test_cpp_extensions_aot.py cannot be invoked directly. Run "
@@ -173,6 +174,76 @@ except ImportError:
 #         self.assertEqual(rng_extension.getInstanceCount(), 1)
 #         del copy2
 #         self.assertEqual(rng_extension.getInstanceCount(), 0)
+
+class TestCUDA_CSPRNG_Generator(common.TestCase):
+
+    def setUp(self):
+        super(TestCUDA_CSPRNG_Generator, self).setUp()
+        csprng_extension.registerOps()
+
+    def test_random(self):
+        gen = csprng_extension.create_CUDA_CSPRNG_Generator()
+        for dtype in [torch.bool, torch.uint8, torch.int8, torch.int16, 
+                      torch.int32, torch.int64, torch.float, torch.double]:
+            t = torch.empty(100, dtype=dtype, device='cuda').random_(generator=gen)
+            # print(t)
+
+    def test_random2(self):
+        gen = csprng_extension.create_CUDA_CSPRNG_Generator()
+        s = torch.zeros(20, 20, dtype=torch.uint8, device='cuda')
+        t = s[:, 7]
+        self.assertFalse(t.is_contiguous())
+        t.random_(generator=gen)
+        t = s[7, :]
+        self.assertTrue(t.is_contiguous())
+        t.random_(generator=gen)
+        # print(s)
+
+    def test_bool(self):
+        gen = csprng_extension.create_CUDA_CSPRNG_Generator()
+        size = 10000
+        for i in range(100):
+            t = torch.empty(size, dtype=torch.bool, device='cuda').random_(generator=gen)
+            percentage = (t.eq(True)).to(torch.int).sum().item() / size
+            self.assertTrue(0.48 < percentage < 0.52)
+
+    def test_ints(self):
+        gen = csprng_extension.create_CUDA_CSPRNG_Generator()
+        for (dtype, size, prec) in [(torch.uint8, 10000, 1), (torch.int8, 10000, 1), (torch.int16, 1000000, 100)]:
+            t = torch.empty(size, dtype=dtype, device='cuda').random_(generator=gen)
+            avg = t.sum().item() / size
+            # print(avg)
+            # print(torch.iinfo(dtype).max / 2)
+            self.assertEqual(avg, torch.iinfo(dtype).max / 2, prec=prec)
+        for (dtype, size, prec) in [(torch.int32, 1000000, 1e7), (torch.int64, 1000000, 1e16)]:
+            t = torch.empty(size, dtype=dtype, device='cuda').random_(generator=gen)
+            avg = (t / size).sum().item()
+            # print(avg)
+            # print(torch.iinfo(dtype).max / 2)
+            self.assertEqual(avg, torch.iinfo(dtype).max / 2, prec=prec)
+
+    def test_uniform(self):
+        gen = csprng_extension.create_CUDA_CSPRNG_Generator()
+        size = 1000
+        alpha = 0.1
+        for dtype in [torch.float, torch.double]:
+            for from_ in [-100, 0, 1000]:
+                for to_ in [-42, 0, 4242]:
+                    if to_ > from_:
+                        range_ = to_ - from_
+                        t = torch.empty(size, dtype=dtype, device='cuda').uniform_(from_, to_, generator=gen)
+                        self.assertTrue(from_  <= t.min() < from_ + alpha * range_)
+                        self.assertTrue(to_ - alpha * range_  <= t.max() < to_)
+
+    def test_normal(self):
+        gen = csprng_extension.create_CUDA_CSPRNG_Generator()
+        size = 1000
+        for dtype in [torch.float, torch.double]:
+            for mean in [-42.42, 0.0, 4242]:
+                for std in [1.0, 2.0, 3.0]:
+                    t = torch.empty(size, dtype=dtype, device='cuda').normal_(mean, std, generator=gen)
+                    self.assertEqual(t.mean().item(), mean, 1)
+                    self.assertEqual(t.std().item(), std, 1)
 
 if __name__ == "__main__":
     common.run_tests()

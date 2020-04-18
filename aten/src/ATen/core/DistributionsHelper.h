@@ -10,6 +10,7 @@
 
 #include <ATen/core/Array.h>
 #include <c10/util/Half.h>
+#include <c10/util/BFloat16.h>
 #include <c10/util/Optional.h>
 #include <type_traits>
 #include <limits>
@@ -68,28 +69,88 @@ using dist_acctype = typename DistAccumType<T>::type;
 
 // Constants for uniform distribution
 // doubles have 52 bits of mantissa (fractional part)
-constexpr uint64_t DOUBLE_MASK = (1ULL << 53) - 1;
-constexpr double DOUBLE_DIVISOR = 1.0 / (1ULL << 53);
+constexpr uint64_t DOUBLE_MASK = (1ULL << std::numeric_limits<double>::digits) - 1;
+constexpr double DOUBLE_DIVISOR = 1.0 / (1ULL << std::numeric_limits<double>::digits);
 
 // floats have 23 bits of mantissa (fractional part)
-constexpr uint32_t FLOAT_MASK = (1 << 24) - 1;
-constexpr float FLOAT_DIVISOR = 1.0f / (1 << 24);
+constexpr uint32_t FLOAT_MASK = (1 << std::numeric_limits<float>::digits) - 1;
+constexpr float FLOAT_DIVISOR = 1.0f / (1 << std::numeric_limits<float>::digits);
+
+template <typename T>
+struct uniform_int_from_to_distribution {
+
+  C10_HOST_DEVICE inline uniform_int_from_to_distribution(uint64_t range_, int64_t base_) {
+    range = range_;
+    base = base_;
+  }
+
+  template <typename RNG>
+  C10_HOST_DEVICE inline T operator()(RNG* generator) {
+    if ((
+      std::is_same<T, int64_t>::value ||
+      std::is_same<T, double>::value ||
+      std::is_same<T, float>::value ||
+      std::is_same<T, at::BFloat16>::value) && range >= 1ULL << 32)
+    {
+      return static_cast<T>(static_cast<int64_t>((generator->random64() % range) + base));
+    } else {
+      return static_cast<T>(static_cast<int64_t>((generator->random() % range) + base));
+    }
+  }
+
+  private:
+    uint64_t range;
+    int64_t base;
+};
+
+template <typename T>
+struct uniform_int_full_range_distribution {
+
+  template <typename RNG>
+  C10_HOST_DEVICE inline T operator()(RNG* generator) {
+    return static_cast<T>(static_cast<int64_t>(generator->random64()));
+  }
+
+};
+
+template <typename T>
+struct uniform_int_distribution {
+
+  template <typename RNG>
+  C10_HOST_DEVICE inline T operator()(RNG* generator) {
+    if (std::is_same<T, bool>::value) {
+      return static_cast<bool>(generator->random() & 1);
+    } else if (std::is_same<T, double>::value) {
+      return static_cast<T>(generator->random64() % static_cast<uint64_t>((1ULL << std::numeric_limits<T>::digits) + 1));
+    } else if (std::is_same<T, int64_t>::value) {
+      return static_cast<T>(generator->random64() % (static_cast<uint64_t>(std::numeric_limits<T>::max()) + 1));
+    } else if (std::is_floating_point<T>::value || std::is_same<T, at::Half>::value || std::is_same<T, at::BFloat16>::value) {
+      return static_cast<T>(generator->random() % static_cast<uint64_t>((1ULL << std::numeric_limits<T>::digits) + 1));
+    } else if (std::is_integral<T>::value) {
+      return static_cast<T>(generator->random() % (static_cast<uint64_t>(std::numeric_limits<T>::max()) + 1));
+    } else {
+      assert(false);
+      return 0;
+    }
+  }
+
+};
 
 /**
- * Samples a uniform distribution in the range [0,1) of type T
+ * Samples a uniform distribution in the range [a, b) of type T
  */
 template <typename T>
 struct uniform_real_distribution {
 
-  inline uniform_real_distribution(T a_in, T b_in) {
-    TORCH_CHECK(a_in <= b_in);
-    TORCH_CHECK(b_in-a_in <= std::numeric_limits<T>::max());
+  C10_HOST_DEVICE inline uniform_real_distribution(T a_in, T b_in) {
+    TORCH_CHECK_IF_NOT_ON_CUDA(a_in <= b_in);
+    TORCH_CHECK_IF_NOT_ON_CUDA(b_in-a_in <= std::numeric_limits<T>::max());
     a = a_in;
     b = b_in;
   }
 
   template <typename RNG>
-  inline dist_acctype<T> operator()(RNG* generator){
+  C10_HOST_DEVICE inline dist_acctype<T> operator()(RNG* generator){
     dist_acctype<T> x;
     if(std::is_same<T, double>::value) {
       x = (generator->random64() & DOUBLE_MASK) * DOUBLE_DIVISOR;
@@ -114,7 +175,7 @@ template <typename T>
 struct normal_distribution {
 
   inline normal_distribution(T mean_in, T stdv_in) {
-    TORCH_CHECK(stdv_in > 0);
+    TORCH_CHECK_IF_NOT_ON_CUDA(stdv_in > 0);
     mean = mean_in;
     stdv = stdv_in;
   }
@@ -122,6 +183,7 @@ struct normal_distribution {
   template <typename RNG>
   inline dist_acctype<T> operator()(RNG* generator){
     dist_acctype<T> ret;
+#if !defined(__CUDACC__) && !defined(__HIPCC__)
     // return cached values if available
     if (std::is_same<T, double>::value) {
       if (generator->next_double_normal_sample()) {
@@ -138,12 +200,14 @@ struct normal_distribution {
         return ret;
       }
     }
+#endif
     // otherwise generate new normal values
     uniform_real_distribution<T> uniform(0.0, 1.0);
     const dist_acctype<T> u1 = uniform(generator);
     const dist_acctype<T> u2 = uniform(generator);
     const dist_acctype<T> r = ::sqrt(static_cast<T>(-2.0) * ::log(static_cast<T>(1.0)-u2));
     const dist_acctype<T> theta = static_cast<T>(2.0) * static_cast<T>(M_PI) * u1;
+#if !defined(__CUDACC__) && !defined(__HIPCC__)
     if (std::is_same<T, double>::value) {
       dist_acctype<double> cache = r * ::sin(theta);
       generator->set_next_double_normal_sample(c10::optional<double>(cache));
@@ -151,6 +215,7 @@ struct normal_distribution {
       dist_acctype<float> cache = r * ::sin(theta);
       generator->set_next_float_normal_sample(c10::optional<float>(cache));
     }
+#endif
     ret = r * ::cos(theta) * stdv + mean;
     return ret;
   }
